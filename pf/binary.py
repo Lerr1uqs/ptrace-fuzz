@@ -40,6 +40,10 @@ class Binary:
     @property
     def blocks_number(self) -> int:
         return len(self.cfgfast.graph.nodes)
+    
+    def edges_num(self)-> int:
+        return self.cfgfast.graph.number_of_edges()
+
 
     def add_instruction_addr_name(self, addr: int, name: str) -> None:
         self._instruction_addr_name[addr] = name
@@ -59,3 +63,6 @@ class Binary:
         all basic block's entry addresses 
         '''
         return [bb.addr for bb in self.cfgfast.graph.nodes]
+
+
+
