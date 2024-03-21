@@ -200,12 +200,11 @@ def main():
     #     coverage,
     #     binary
     # )
-    ptracer.execute()
+    #ptracer.show_states()
+    ptracer.start_fuzz()
     ptracer.finish()
 
     
-
-
 
 
 if __name__ == "__main__":
