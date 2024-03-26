@@ -13,7 +13,7 @@ from ptrace.tools import locateProgram
 from typing import Dict, Callable, List
 from pf.binary import Binary
 from angr.analyses import CFGFast
-
+from datetime import datetime
 from elftools.elf.elffile import ELFFile
 import inspect
 import signal
@@ -23,6 +23,7 @@ import os
 import subprocess
 import time
 import selectors
+import threading
 import pytermgui as ptg
 
 def color_string(text, color):
@@ -115,14 +116,14 @@ def create_child_process(args: List[str], fuzzout_fd: int,null_fd:int, env: Dict
         # os.waitpid(pid, 0)
         return pid
     else:
-        print(fuzzout_fd)
+        #print(fuzzout_fd)
         os.dup2(fuzzout_fd, 0) # 将stdin指向fuzzout_fd
         os.dup2(null_fd,1)
         # /usr/include/linux/ptrace.h
         PTRACE_TRACEME = 0
         result = libc.ptrace(PTRACE_TRACEME, pid, 0, 0) # check_errno
 
-        print("PTRACE_TRACEME over")
+        #print("PTRACE_TRACEME over")
         if env is not None:
             os.execvpe(args[0], args, env)
         else:
@@ -167,6 +168,7 @@ def removeBreakpoint(self, breakpoint):
 class Ptracer:
     def __init__(self, program_path: Union[str, Path],sample_queue:List[QueueEntry],null_fd:int,out_dir=None) -> None:
         #queue
+        self.fuzz_start_time=time.time()
         self.null_fd=null_fd
         self.out_dir=out_dir
         self.crash_dir = os.path.join(self.out_dir, "crashes")
@@ -179,8 +181,9 @@ class Ptracer:
         self.current_queue=None
         # result
         self.crashes=0
+        self.total_tmouts=0
         self.queue_cycle=0
-
+        self.test_num=0
         # @TODO : timeout setting
         self.test_flag=True
         self.wait_timeout=1
@@ -232,6 +235,16 @@ class Ptracer:
 
         # # NOTE: patch the process
         # self._process.removeBreakpoint = types.MethodType(removeBreakpoint, process)
+        # show thread
+        show_states_thread = threading.Thread(target=self.show_states)
+        show_states_thread.daemon = True  # 设置为守护线程，确保主线程退出时该线程也会退出
+        #show_states_thread.start()  # 启动线程
+
+    # def test_thread(self):
+    #     while True:
+    #         time.sleep(3)
+    #         self.show_states()
+
 
     def coverage_collect(self,rip,prev_rip) -> None:
         #print(f"hit at {self.binary.instruction_name_at(rip)} where 0x{rip:x}")
@@ -251,11 +264,28 @@ class Ptracer:
     # def pid(self) -> None:
     #     return self._process.pid
     
-    
+    def has_new_edge(self) -> bool:
+        """
+        Check if there are any new edges covered in the trace_coverage.
+
+        Returns:
+            bool: True if there are new edges covered, False otherwise.
+        """
+        trace_edges = set(self.trace_coverage.keys())
+        coverage_edges = set(self.coverage.keys())
+
+        return trace_edges - coverage_edges != set()
+
+
     def update_coverage(self)->None:
         #TODO
-        1
-
+        for edge,count in self.trace_coverage.items():
+            if edge in self.coverage:
+                if(self.coverage[edge]<count):
+                    self.coverage[edge]=count
+            else:
+                self.coverage[edge]=count
+        
     def start_fuzz(self) ->None:
         
 
@@ -275,8 +305,12 @@ class Ptracer:
                 self.fuzz_one()
             self.queue_cycle+=1
 
+    def abandon_entry(self):
+        return 0
+
 
     def fuzz_one(self) -> int :
+        self.trace_coverage.clear()
         if self._process is not None:
             self._process.kill(signal.SIGTERM)
         #os.kill(self.pid)
@@ -291,12 +325,87 @@ class Ptracer:
         # 4\n%5$n\n -> fmt fault
         # 4\naaaa\n  
         self.current_queue=self.fuzz_queue.pop()
-        print("now input:"+self.current_queue.fname)
-        print(self.current_queue.read_file())
-        os.write(self.pwrite_fd, self.current_queue.read_file())
-        return self.execute()
+        if self.current_queue.was_fuzzed==False:
+            #print("now input:"+self.current_queue.fname)
+            #print(self.current_queue.read_file())
+            out_buf=self.current_queue.read_file()
+            os.write(self.pwrite_fd, out_buf)
+            result= self.execute()
+            self.save_if_interesting(out_buf,result)
+            self.update_coverage()
+            return 0
+
+        #return 0
+        #TODO 
+        # @1_1
+        out_buf=self.current_queue.read_file()
+        len=self.current_queue.len
+        stage_max=len
+        for stage_cur in range(stage_max):
+            stage_cur_byte = stage_cur >> 3
+            #print(b"before:"+out_buf)
+            out_buf=flip_bit(out_buf, stage_cur)
+            #print(b"out:"+out_buf)
+            if (self.common_fuzz_stuff(out_buf)):
+                self.abandon_entry()
+            out_buf=flip_bit(out_buf, stage_cur)
+        # @2_1
+        stage_max = (len << 3) - 1
+        for stage_cur in range(stage_max):
+            out_buf=flip_bit(out_buf, stage_cur)
+            flip_bit(out_buf, stage_cur + 1)
+            if (self.common_fuzz_stuff(out_buf)):
+                self.abandon_entry()
+            out_buf=flip_bit(out_buf, stage_cur)
+            flip_bit(out_buf, stage_cur + 1)
+        # @4_1
+        stage_max = (len << 3) - 3
+        for stage_cur in range(stage_max):
+            out_buf=flip_bit(out_buf, stage_cur)
+            flip_bit(out_buf, stage_cur + 1)
+            flip_bit(out_buf, stage_cur + 2)
+            flip_bit(out_buf, stage_cur + 3)
+            if (self.common_fuzz_stuff(out_buf)):
+                self.abandon_entry()
+            out_buf=flip_bit(out_buf, stage_cur)
+            flip_bit(out_buf, stage_cur + 1)
+            flip_bit(out_buf, stage_cur + 2)
+            flip_bit(out_buf, stage_cur + 3)
+        # @8_8
+        stage_max=len
+        out_buf = bytearray(out_buf)
+        out_buf[stage_cur] ^= 0xFF
+        for stage_cur in range(stage_max):
+            stage_cur_byte = stage_cur
+
+            out_buf[stage_cur] ^= 0xFF
+            if (self.common_fuzz_stuff(out_buf)):
+                self.abandon_entry()
+            out_buf[stage_cur] ^= 0xFF
+        # @16_8
+        stage_cur = 0
+        stage_max = len - 1
+        for i in range(len - 1):
+            stage_cur_byte = i
+            # Assuming out_buf is a bytes-like object
+            out_buf = bytearray(out_buf)
+            u16_value = int.from_bytes(out_buf[i:i+2], byteorder='little')
+            u16_value ^= 0xFFFF
+            out_buf[i:i+2] = u16_value.to_bytes(2, byteorder='little')
+
+            if self.common_fuzz_stuff(out_buf):
+                self.abandon_entry()
+            stage_cur += 1
+
+            # Revert the change
+            u16_value ^= 0xFFFF
+            out_buf[i:i+2] = u16_value.to_bytes(2, byteorder='little')
+            #self.update_coverage()
+
+
 
     def test_queue(self,queue:QueueEntry)->int:
+        self.trace_coverage.clear()
         if self._process is not None:
             self._process.kill(signal.SIGTERM)
         #os.kill(self.pid)
@@ -312,10 +421,13 @@ class Ptracer:
         # 4\naaaa\n  
         #self.current_queue=self.fuzz_queue.pop()
         self.current_queue=queue
-        print("now input:"+self.current_queue.fname)
-        print(self.current_queue.read_file())
+        #print("now input:"+self.current_queue.fname)
+        #print(self.current_queue.read_file())
         os.write(self.pwrite_fd, self.current_queue.read_file())
-        return self.execute()
+        result= self.execute()
+        #TODO 
+        self.update_coverage()
+        return result
 
 
     def finish(self) -> None:
@@ -330,11 +442,27 @@ class Ptracer:
     def calculate_score(self)->None:
         1
     
-    def save_if_interesting(self)->None:
+    def save_if_interesting(self,out_buf,fault)->int:
         # TODO
-        filename = os.path.join(self.queue_dir, self.current_queue.fname[3:])
-        with open(filename, "wb") as f:
-            f.write(self.current_queue.read_file())
+        if self.has_new_edge():
+            current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            filename = os.path.join(self.queue_dir,f"id:{current_time}")
+            with open(filename, "wb") as f:
+                f.write(out_buf)
+            new_queue=QueueEntry()
+            new_queue.set_file(filename)
+            new_queue.was_fuzzed=True
+            self.fuzz_queue.insert(0,new_queue)
+            if fault==FAULT_CRASH:
+                self.crash_handle()
+            elif fault==FAULT_TIMEOUT:
+                return 0
+            elif fault==FAULT_HANGS:    
+                self.total_tmouts+=1
+                return 1
+            return 0
+        else:
+            return 1
 
     def common_fuzz_stuff(self,out_buf)->int:
         write_to_testcase(out_buf)
@@ -342,31 +470,40 @@ class Ptracer:
         test_queue.set_file(CUR_TEST)
         # print(test_queue.len)
         # print(test_queue.read_file())
-        fault=self.fuzz_queue(test_queue)
+        fault=self.test_queue(test_queue)
         #if fault==FAULT_TIMEOUT:
-        self.save_if_interesting(out_buf)
+        result=self.save_if_interesting(out_buf,fault)
+        self.update_coverage()
+        return result
 
-    def bitflip(self,queue:QueueEntry):
-        #1——1
-        out_buf=queue.read_file()
-        stage_max=queue.len<<3
-        for stage_cur in range(stage_max):
-            stage_cur_byte = stage_cur >> 3
-            flip_bit(out_buf, stage_cur)
-            if (self.common_fuzz_stuff(out_buf)):
-                1
-            flip_bit(out_buf, stage_cur)
-
-
+    # def bitflip(self,queue:QueueEntry):
+    #     #1——1
+    #     out_buf=queue.read_file()
+    #     stage_max=queue.len<<3
+    #     for stage_cur in range(stage_max):
+    #         stage_cur_byte = stage_cur >> 3
+    #         out_buf=flip_bit(out_buf, stage_cur)
+    #         if (self.common_fuzz_stuff(out_buf)):
+    #             1
+    #         out_buf=flip_bit(out_buf, stage_cur)
 
     def showcoverage(self) -> None:
         rate = len(self.coverage.keys()) / self.binary.edges_num()
-        print(f"coverage rate is {rate:2f}")
+        #print(f"coverage rate is {rate:2f}")
 
     def exit_program(self,manager:ptg.WindowManager):
         manager.stop()
 
+    # def get_num(self):
+    #     self.test_num+=1
+    #     return self.test_num
+
     def show_states(self) -> None:
+        #print("here")
+        #ptg.tim.define("!time",self.get_num)
+        self.test_num+=1
+        run_time=time.time()-self.fuzz_start_time
+        run_time_str="{} seconds".format(run_time)
         CONFIG = """
         config:
             Label:
@@ -383,9 +520,9 @@ class Ptracer:
         """
 
         container1 = ptg.Window(
-            ptg.Label("         run time :  xxdafd"),
+            ptg.Label("         run time :  "+run_time_str),
             ptg.Label("    last new find :  xx"),
-            ptg.Label(" last saved crash :  xx"),
+            ptg.Label(" last saved crash :  "),
             ptg.Label("  last saved hang :  xx"),
             width=25,
             height=2,
@@ -490,18 +627,22 @@ class Ptracer:
                     splitter4,
 
                     ["Exit", lambda *_: self.exit_program(manager)],
-                    width=120,
+                    width=100,
                     #box="DOUBLE",
                 )
                 .set_title("[210 bold]AFL Output")
                 #.center()
             )
+            manager.layout.add_slot("Body")
             manager.add(window)
+            #print("start run")
+            #manager.run()
+            #manager.run()
 
 
     def handle_timeout(self, signum, frame):
         # TODO 处理超时
-        print("***test timeout***")
+        #print("***test timeout***")
         self.showcoverage()
         self._process.kill(signal.SIGALRM)
         return
@@ -521,24 +662,27 @@ class Ptracer:
         # 4\n%5$n\n -> fmt fault
         # 4\naaaa\n  
         self.current_queue=self.fuzz_queue.pop()
-        print("now input:"+self.current_queue.fname)
-        print(self.current_queue.read_file())
+        #print("now input:"+self.current_queue.fname)
+        #print(self.current_queue.read_file())
         os.write(self.pwrite_fd, self.current_queue.read_file())
         self.execute()
 
     def crash_handle(self) ->None:
-        filename = os.path.join(self.crash_dir, self.current_queue.fname[3:])
+        self.crashes+=1
+        filename = os.path.join(self.crash_dir, os.path.basename(self.current_queue.fname))
         with open(filename, "wb") as f:
             f.write(self.current_queue.read_file())
             #f.close()
-        # crash 变异 
+
     
     #def execute(self, callback: Callable[[PtraceProcess, int], None], *args, **kvargs) -> None:
     def execute(self) -> int:
         # if len(inspect.getfullargspec(callback)) < 2:
         #     raise TypeError("function signature is `def Function(process,rip) -> None`")
+        self.queue_cycle+=1
+        #print("show")
+        #self.show_states()
 
-        print("execute")
         process = self._process
         signal.signal(signal.SIGALRM, self.handle_timeout)
         start_time=time.time()
@@ -550,28 +694,31 @@ class Ptracer:
             process.cont()  
             execution_time =time.time()-start_time
             if execution_time > self.execute_timeout:
-                print('hangs')
+                #print('hangs')
                 return FAULT_HANGS
             #print("here")
             event: ProcessSignal = process.waitEvent()
             if event.signum != signal.SIGTRAP:
-                print(f"encounter event {event.signum} {event}")
+                #print(f"encounter event {event.signum} {event}")
                 if event.signum is None:  # 正常退出
-                    print("[*] Program exited normally")
+                    #print("[*] Program exited normally")
+                    #self.update_coverage()
                     self.showcoverage()
                     return NORMAL_EXIT
                 elif event.signum == signal.SIGTERM:
                     #self._process.kill(signal.SIGTERM)
-                    print("Get timeout")
+                    #print("Get timeout")
                     process.detach()
+                    #self.update_coverage()
                     return 0
                 elif event.signum == signal.SIGALRM:
-                    print("get timeout")
+                    #print("get timeout")
                     return FAULT_TIMEOUT
                 else:
-                    print("[*] ***** get crash here ****")
-                    print(self.current_queue.fname)
-                    self.crash_handle()
+                    #print("[*] ***** get crash here ****")
+                    #print(self.current_queue.fname)
+                    #self.update_coverage()
+                    #self.crash_handle()
                     self.showcoverage()
                     #self.restart()
                     return FAULT_CRASH
