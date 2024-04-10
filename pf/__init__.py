@@ -15,6 +15,7 @@ from pf.binary import Binary
 from angr.analyses import CFGFast
 from datetime import datetime
 from elftools.elf.elffile import ELFFile
+from datetime import datetime
 import inspect
 import signal
 import types
@@ -54,6 +55,12 @@ def write_to_testcase(out_buf)->None:
         pass
     with open(CUR_TEST, "wb") as f:
         f.write(out_buf)
+
+def format_elapsed_time(seconds):
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return "{:02}:{:02}:{:02}".format(int(hours), int(minutes), int(seconds))
+
 
 CUR_TEST = "./out/queue/cur_test"
 
@@ -181,9 +188,15 @@ class Ptracer:
         self.current_queue=None
         # result
         self.crashes=0
+        self.last_save_crash=None
+        self.last_save_hang=None
         self.total_tmouts=0
         self.queue_cycle=0
         self.test_num=0
+        self.cycles_done=0
+        self.total_coverage_result=0
+        self.trace_coverage_result=0
+
         # @TODO : timeout setting
         self.test_flag=True
         self.wait_timeout=1
@@ -238,12 +251,9 @@ class Ptracer:
         # show thread
         show_states_thread = threading.Thread(target=self.show_states)
         show_states_thread.daemon = True  # 设置为守护线程，确保主线程退出时该线程也会退出
-        #show_states_thread.start()  # 启动线程
+        show_states_thread.start()  # 启动线程
 
-    # def test_thread(self):
-    #     while True:
-    #         time.sleep(3)
-    #         self.show_states()
+
 
 
     def coverage_collect(self,rip,prev_rip) -> None:
@@ -251,6 +261,7 @@ class Ptracer:
         if rip in self.binary.block_entry_addresses:
             # hit a basic block
             self.trace_coverage[rip^prev_rip] += 1
+            self.trace_coverage_result= len(self.trace_coverage.keys()) / self.binary.edges_num()
             #print("test ++")
         else:
             1#maybe crash 
@@ -285,6 +296,7 @@ class Ptracer:
                     self.coverage[edge]=count
             else:
                 self.coverage[edge]=count
+        self.total_coverage_result = len(self.coverage.keys()) / self.binary.edges_num()
         
     def start_fuzz(self) ->None:
         
@@ -497,13 +509,39 @@ class Ptracer:
     # def get_num(self):
     #     self.test_num+=1
     #     return self.test_num
+        
+    def macro_time(self,fmt: str) -> str:
+        run_time=time.time()-self.fuzz_start_time
+        return format_elapsed_time(run_time)
+
+    def get_crashnum(self,fmt:str)->str:
+        return str(self.crashes)
+
+    def get_last_crash(self,fmt:str)->str:
+        if self.last_save_crash is None:
+            return "None"
+        return self.last_save_crash.strftime("%Y-%m-%d %H:%M:%S")
+
+    def get_trace_coverage(self,fmt:str)->str:
+        coverage_str = "{:.2%}".format(self.trace_coverage_result)
+        return coverage_str
+
+    def get_total_coverage(self,fmt:str)->str:
+        coverage_str = "{:.2%}".format(self.total_coverage_result)
+        return coverage_str
+
+
 
     def show_states(self) -> None:
         #print("here")
         #ptg.tim.define("!time",self.get_num)
-        self.test_num+=1
-        run_time=time.time()-self.fuzz_start_time
-        run_time_str="{} seconds".format(run_time)
+        ptg.tim.define("!time", self.macro_time)
+        ptg.tim.define("!crash_num", self.get_crashnum)
+        ptg.tim.define("!get_last_crash", self.get_last_crash)
+        ptg.tim.define("!get_trace_coverage", self.get_trace_coverage)
+        ptg.tim.define("!get_total_coverage", self.get_total_coverage)
+
+
         CONFIG = """
         config:
             Label:
@@ -520,9 +558,9 @@ class Ptracer:
         """
 
         container1 = ptg.Window(
-            ptg.Label("         run time :  "+run_time_str),
+            ptg.Label("         run time :  [!time 83]%c"),
             ptg.Label("    last new find :  xx"),
-            ptg.Label(" last saved crash :  "),
+            ptg.Label(" last saved crash :  [!get_last_crash 83]%c"),
             ptg.Label("  last saved hang :  xx"),
             width=25,
             height=2,
@@ -533,7 +571,7 @@ class Ptracer:
         container2 = ptg.Window(
             ptg.Label("  cycles done :  xx"),
             ptg.Label(" corpus count :  xx"),
-            ptg.Label(" save crashes :  xx"),
+            ptg.Label(" save crashes :  [!crash_num 83]%c"),
             ptg.Label("   save hangs :  xx"),
             width=25,
             height=2,
@@ -550,8 +588,8 @@ class Ptracer:
         container3.set_title('[blue]cycle progress')
 
         container4 = ptg.Window(
-            ptg.Label("    map density : 0.18 (0.0%)"),
-            ptg.Label(" count coverage : 0 (0.00%)"),
+            ptg.Label("    map density : [!get_trace_coverage 83]%c"),
+            ptg.Label(" count coverage : [!get_total_coverage 83]%c"),
             width=25,
             height=1,
         )
@@ -628,10 +666,10 @@ class Ptracer:
 
                     ["Exit", lambda *_: self.exit_program(manager)],
                     width=100,
-                    #box="DOUBLE",
+                    box="DOUBLE",
                 )
                 .set_title("[210 bold]AFL Output")
-                #.center()
+                .center()
             )
             manager.layout.add_slot("Body")
             manager.add(window)
@@ -669,6 +707,7 @@ class Ptracer:
 
     def crash_handle(self) ->None:
         self.crashes+=1
+        self.last_save_crash=datetime.now()
         filename = os.path.join(self.crash_dir, os.path.basename(self.current_queue.fname))
         with open(filename, "wb") as f:
             f.write(self.current_queue.read_file())
@@ -680,8 +719,7 @@ class Ptracer:
         # if len(inspect.getfullargspec(callback)) < 2:
         #     raise TypeError("function signature is `def Function(process,rip) -> None`")
         self.queue_cycle+=1
-        #print("show")
-        #self.show_states()
+
 
         process = self._process
         signal.signal(signal.SIGALRM, self.handle_timeout)

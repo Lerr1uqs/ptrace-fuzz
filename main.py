@@ -177,9 +177,10 @@ null_fd=None
 
 testt="a"
 def macro_time(fmt: str) -> str:
-    global testt
-    testt=testt+"a"
-    return testt
+    # global testt
+    # testt=testt+"a"
+    # return testt
+    return time.strftime(fmt)
 
 
 
@@ -190,7 +191,7 @@ def main():
         null_fd=os.open("/dev/null", os.O_WRONLY)
     except Exception as e:
         print(f"Error opening /dev/null: {e}")
-    os.dup2(null_fd,2)
+    #os.dup2(null_fd,2)
     parse_args()
     init_queue()
     #init_dirs()
@@ -206,13 +207,13 @@ def main():
     ptracer = Ptracer(p,sample_queue,null_fd,out_dir)
     binary = ptracer.binary
 
-    ptg.tim.define("!time", macro_time)
+    # ptg.tim.define("!time", macro_time)
 
-    with ptg.WindowManager() as manager:
-        manager.layout.add_slot("Body")
-        manager.add(
-            ptg.Window("[bold]The current time is:[/]\n\n[!time 83]   %c")
-        )
+    # with ptg.WindowManager() as manager:
+    #     manager.layout.add_slot("Body")
+    #     manager.add(
+    #         ptg.Window("[bold]The current time is:[/]\n\n[!time 83]   %c")
+    #     )
 
 
     # ptracer.execute(
@@ -221,8 +222,8 @@ def main():
     #     binary
     # )
     #ptracer.show_states()
-    # ptracer.start_fuzz()
-    # ptracer.finish()
+    ptracer.start_fuzz()
+    ptracer.finish()
 
     
 
