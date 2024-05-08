@@ -12,7 +12,7 @@ import time
 import pytermgui as ptg
 in_dir = ""
 out_dir = ""
-
+input_file=""
 
 
 USAGE_STRING = (
@@ -60,7 +60,7 @@ def show_usages():
 
 
 def parse_args():
-    global in_dir,out_dir
+    global in_dir,out_dir,input_file
     out_dir="out"
 
     parser = argparse.ArgumentParser(description="")
@@ -77,6 +77,7 @@ def parse_args():
 
     # 使用参数
     in_dir = args.input_dir
+    input_file=args.input_file
     #out_dir = args.output_dir
 
 def init_dirs():
@@ -191,15 +192,15 @@ def main():
         null_fd=os.open("/dev/null", os.O_WRONLY)
     except Exception as e:
         print(f"Error opening /dev/null: {e}")
-    #os.dup2(null_fd,2)
+    os.dup2(null_fd,2)
     parse_args()
     init_queue()
     #init_dirs()
 
     check_crash_handling();
 
-    p = "./samples/test"
-
+    #p = "./samples/test"
+    p=input_file
     #p = "./samples/read_in"
 
     coverage = defaultdict(lambda: 0)

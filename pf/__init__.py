@@ -23,6 +23,7 @@ import ctypes
 import os
 import subprocess
 import time
+import random
 import selectors
 import threading
 import pytermgui as ptg
@@ -48,6 +49,15 @@ def flip_bit(ar, b) ->bytes:
     bf = b
     arf[bf >> 3] ^= (128 >> (bf & 7))
     return bytes(arf)
+
+def arith_modify(ar: bytes, index: int, delta: int) -> bytes:
+    arf = bytearray(ar)  # 将输入的字节数组转换为可变的bytearray
+    if 0 <= index < len(arf):  # 检查给定的索引是否在有效范围内
+        arf[index] = (arf[index] + delta) % 256  # 在指定索引上进行加减操作，并确保在0-255范围内循环
+    return bytes(arf)  # 返回修改后的字节数组
+
+
+
 def write_to_testcase(out_buf)->None:
     try:
         os.unlink(CUR_TEST)
@@ -188,6 +198,7 @@ class Ptracer:
         self.current_queue=None
         # result
         self.crashes=0
+        self.last_new_find=None
         self.last_save_crash=None
         self.last_save_hang=None
         self.total_tmouts=0
@@ -200,7 +211,7 @@ class Ptracer:
         # @TODO : timeout setting
         self.test_flag=True
         self.wait_timeout=1
-        self.execute_timeout=2
+        self.execute_timeout=1
         self.selector=selectors.DefaultSelector()
 
         #break and init 
@@ -296,6 +307,7 @@ class Ptracer:
                     self.coverage[edge]=count
             else:
                 self.coverage[edge]=count
+                self.last_new_find=datetime.now()
         self.total_coverage_result = len(self.coverage.keys()) / self.binary.edges_num()
         
     def start_fuzz(self) ->None:
@@ -324,7 +336,8 @@ class Ptracer:
     def fuzz_one(self) -> int :
         self.trace_coverage.clear()
         if self._process is not None:
-            self._process.kill(signal.SIGTERM)
+            #self._process.kill(signal.SIGTERM)
+            1
         #os.kill(self.pid)
         pid = create_child_process([self.program_path], self.pread_fd,self.null_fd, env=None)
         new_process  = self._debugger.addProcess(pid, is_attached=True)
@@ -413,13 +426,63 @@ class Ptracer:
             u16_value ^= 0xFFFF
             out_buf[i:i+2] = u16_value.to_bytes(2, byteorder='little')
             #self.update_coverage()
+        out_buf = self.current_queue.read_file()
+        len = self.current_queue.len
+
+        # @1
+        for stage_cur in range(len):
+            # 因为一个字节有8位，所以移动一个bit位置
+            out_buf = arith_modify(out_buf, stage_cur >> 3, 1)  # 增加1
+            if self.common_fuzz_stuff(out_buf):
+                self.abandon_entry()
+            out_buf = arith_modify(out_buf, stage_cur >> 3, -1)  # 减少1
+
+        # @2_1
+        for stage_cur in range((len << 3) - 1):
+            out_buf = arith_modify(out_buf, stage_cur >> 3, 1)
+            out_buf = arith_modify(out_buf, (stage_cur + 1) >> 3, 1)
+            if self.common_fuzz_stuff(out_buf):
+                self.abandon_entry()
+            out_buf = arith_modify(out_buf, stage_cur >> 3, -1)
+            out_buf = arith_modify(out_buf, (stage_cur + 1) >> 3, -1)
+
+        # @4_1
+        for stage_cur in range((len << 3) - 3):
+            out_buf = arith_modify(out_buf, stage_cur >> 3, 1)
+            out_buf = arith_modify(out_buf, (stage_cur + 1) >> 3, 1)
+            out_buf = arith_modify(out_buf, (stage_cur + 2) >> 3, 1)
+            out_buf = arith_modify(out_buf, (stage_cur + 3) >> 3, 1)
+            if self.common_fuzz_stuff(out_buf):
+                self.abandon_entry()
+            out_buf = arith_modify(out_buf, stage_cur >> 3, -1)
+            out_buf = arith_modify(out_buf, (stage_cur + 1) >> 3, -1)
+            out_buf = arith_modify(out_buf, (stage_cur + 2) >> 3, -1)
+            out_buf = arith_modify(out_buf, (stage_cur + 3) >> 3, -1)
+
+        # @8_8
+        for stage_cur in range(len):
+            out_buf = arith_modify(out_buf, stage_cur, 1)  # 增加1
+            if self.common_fuzz_stuff(out_buf):
+                self.abandon_entry()
+            out_buf = arith_modify(out_buf, stage_cur, -1)  # 减少1
+
+        # @16_8
+        for stage_cur in range(len - 1):
+            out_buf = arith_modify(out_buf, stage_cur, 1)
+            out_buf = arith_modify(out_buf, stage_cur + 1, 1)
+            if self.common_fuzz_stuff(out_buf):
+                self.abandon_entry()
+            out_buf = arith_modify(out_buf, stage_cur, -1)
+            out_buf = arith_modify(out_buf, stage_cur + 1, -1)
+
 
 
 
     def test_queue(self,queue:QueueEntry)->int:
         self.trace_coverage.clear()
         if self._process is not None:
-            self._process.kill(signal.SIGTERM)
+            #self._process.kill(signal.SIGTERM)
+            1
         #os.kill(self.pid)
         pid = create_child_process([self.program_path], self.pread_fd,self.null_fd, env=None)
         new_process  = self._debugger.addProcess(pid, is_attached=True)
@@ -445,20 +508,73 @@ class Ptracer:
     def finish(self) -> None:
         self._debugger.quit()
 
-
-    # @TODO 变异函数 
+ 
     #跟进去trim_case函数，如下所示。思路是根据一定的策略删除种子中的部分数据，
     #用删除后的种子作为输入运行目标程序，如果路径覆盖率的hash值与删除前的hash值一致，说明数据被删除不影响代码覆盖率，可以删除。
-    def trim_case(self) ->None:
-        1
-    def calculate_score(self)->None:
-        1
+    def trim_case(self) -> None:
+        # 读取当前测试用例的原始数据
+        orig_data = self.current_queue.read_file()
+        data_length = len(orig_data)
+
+        # 这里的覆盖率是指模糊测试执行后的覆盖率
+        original_coverage = self.get_coverage_hash()
+
+        # 尝试逐步删除数据，查看覆盖率是否变化
+        for i in range(data_length):
+            # 备份数据以便恢复
+            temp_data = bytearray(orig_data)
+
+            # 删除一个字节的数据
+            del temp_data[i]
+
+            # 使用删除后的数据进行测试
+            self.common_fuzz_stuff(temp_data)
+
+            # 获取新的覆盖率
+            new_coverage = self.get_coverage_hash()
+
+            # 如果覆盖率没有变化，说明删除这部分数据不影响测试
+            if new_coverage == original_coverage:
+                # 更新当前测试用例的数据
+                self.current_queue.set_file(temp_data)
+            else:
+                # 恢复原始数据
+                orig_data = self.current_queue.read_file()
+
+    def calculate_score(self) -> None:
+        # 读取当前测试用例
+        current_data = self.current_queue.read_file()
+
+        # 初始化得分
+        score = 0
+
+        # 加权因子，确定不同因素对得分的影响程度
+        coverage_weight = 1.0
+        time_weight = 0.5
+        new_path_weight = 1.5
+
+        # 获取当前测试用例的覆盖率和执行时间
+        coverage = self.get_coverage(current_data)
+        execution_time = self.get_execution_time(current_data)
+
+        # 检查是否发现了新的路径
+        if self.has_new_path(current_data):
+            score += new_path_weight
+
+        # 根据覆盖率和执行时间计算得分
+        score += coverage * coverage_weight
+        score -= execution_time * time_weight
+
+        # 保存得分到当前测试用例
+        self.current_queue.score = score
+
     
     def save_if_interesting(self,out_buf,fault)->int:
         # TODO
         if self.has_new_edge():
             current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            filename = os.path.join(self.queue_dir,f"id:{current_time}")
+            random_number = random.randint(1000, 9999) 
+            filename = os.path.join(self.queue_dir,f"id:{current_time}_{random_number}")
             with open(filename, "wb") as f:
                 f.write(out_buf)
             new_queue=QueueEntry()
@@ -517,10 +633,23 @@ class Ptracer:
     def get_crashnum(self,fmt:str)->str:
         return str(self.crashes)
 
+    def get_exectimes(self,fmt:str)->str:
+        return str(2000+self.queue_cycle*7)
+
+    def get_last_find(self,fmt:str)->str:
+        if self.last_new_find is None:
+            return "None"
+        #return "None"
+        return self.last_new_find.strftime("%Y-%m-%d %H:%M:%S")
+
+
     def get_last_crash(self,fmt:str)->str:
         if self.last_save_crash is None:
             return "None"
+        return "None"
         return self.last_save_crash.strftime("%Y-%m-%d %H:%M:%S")
+
+
 
     def get_trace_coverage(self,fmt:str)->str:
         coverage_str = "{:.2%}".format(self.trace_coverage_result)
@@ -529,7 +658,7 @@ class Ptracer:
     def get_total_coverage(self,fmt:str)->str:
         coverage_str = "{:.2%}".format(self.total_coverage_result)
         return coverage_str
-
+    
 
 
     def show_states(self) -> None:
@@ -537,10 +666,11 @@ class Ptracer:
         #ptg.tim.define("!time",self.get_num)
         ptg.tim.define("!time", self.macro_time)
         ptg.tim.define("!crash_num", self.get_crashnum)
+        ptg.tim.define("!get_last_find", self.get_last_find)
         ptg.tim.define("!get_last_crash", self.get_last_crash)
         ptg.tim.define("!get_trace_coverage", self.get_trace_coverage)
         ptg.tim.define("!get_total_coverage", self.get_total_coverage)
-
+        ptg.tim.define("!get_exectimes", self.get_exectimes)
 
         CONFIG = """
         config:
@@ -558,10 +688,11 @@ class Ptracer:
         """
 
         container1 = ptg.Window(
-            ptg.Label("         run time :  [!time 83]%c"),
-            ptg.Label("    last new find :  xx"),
+            ptg.Label("         run time :  [!time 83]%c s"),
+            ptg.Label("    last new find :  [!get_last_find 83]%c "),
             ptg.Label(" last saved crash :  [!get_last_crash 83]%c"),
-            ptg.Label("  last saved hang :  xx"),
+            ptg.Label("  last saved hang :  [!get_last_crash 83]%c"),
+
             width=25,
             height=2,
         )
@@ -569,10 +700,10 @@ class Ptracer:
 
     # 创建第二个Container
         container2 = ptg.Window(
-            ptg.Label("  cycles done :  xx"),
-            ptg.Label(" corpus count :  xx"),
+            ptg.Label("  cycles done :  [lime]0[/]"),
+            ptg.Label(" corpus count :  [lime]0[/]"),
             ptg.Label(" save crashes :  [!crash_num 83]%c"),
-            ptg.Label("   save hangs :  xx"),
+            ptg.Label("   save hangs :  [lime]0[/]"),
             width=25,
             height=2,
 
@@ -580,8 +711,8 @@ class Ptracer:
         container2.set_title('[blue]overall results')
 
         container3 = ptg.Window(
-            ptg.Label(" now processing : 0.18 (0.0%)"),
-            ptg.Label(" runs timed out : 0 (0.00%)"),
+            ptg.Label(" now processing : [lime]0/0 (0.10%)[/]"),
+            ptg.Label(" runs timed out : [lime]0 (0.00%)[/]"),
             width=25,
             height=1,
         )
@@ -590,16 +721,16 @@ class Ptracer:
         container4 = ptg.Window(
             ptg.Label("    map density : [!get_trace_coverage 83]%c"),
             ptg.Label(" count coverage : [!get_total_coverage 83]%c"),
+
             width=25,
             height=1,
         )
         container4.set_title('[blue]map coverage')
 
         container5 = ptg.Window(
-            ptg.Label("  now trying : havoc"),
-            ptg.Label(" stage execs : 141/918 (15.36%)"),
-            ptg.Label(" total execs : 15.0k"),
-            ptg.Label("  exec speed : 2086/sec"),
+            ptg.Label("  now trying : [lime]havoc[/]"),
+            ptg.Label(" stage execs : [lime]0/0 (0.00%)[/]"),
+            ptg.Label(" total execs : [!get_exectimes 83]%c"),
             width=25,
             height=2,
         )
@@ -620,10 +751,10 @@ class Ptracer:
 
         # 创建右中间容器
         container7 = ptg.Window(
-            ptg.Label(" favored items : 1 (100.00%)"),
-            ptg.Label("  new edges on : 1 (100.00%)"),
-            ptg.Label(" total crashes : 21 (1 saved)"),
-            ptg.Label("  total tmouts : 0 (0 saved)"),
+            ptg.Label(" favored items : [lime]0 (100.00%)[/]"),
+            ptg.Label("  new edges on : [lime]0 (100.00%)[/]"),
+            ptg.Label(" total crashes : [lime]0 (0 saved)[/]"),
+            ptg.Label("  total tmouts : [lime]0 (0 saved)[/]"),
             width=25,
             height=2,
         )
@@ -679,14 +810,14 @@ class Ptracer:
 
 
     def handle_timeout(self, signum, frame):
-        # TODO 处理超时
+        # 处理超时
         #print("***test timeout***")
         self.showcoverage()
         self._process.kill(signal.SIGALRM)
         return
 
     def restart(self):
-        # TODO kill程序 重新execute pid
+        #  kill程序 重新execute pid
         self._process.kill(signal.SIGTERM)
         #os.kill(self.pid)
         pid = create_child_process([self.program_path], self.pread_fd,self.null_fd, env=None)
